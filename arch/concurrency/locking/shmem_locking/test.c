@@ -8,7 +8,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <stdlib.h>
-
+#include <string.h>
 #include "lock.h"
 
 #define VERBOSE_OUT(verbose, format, args...) { \
@@ -83,10 +83,8 @@ void parse_cmdline(int argc, char **argv)
 {
     int i;
     for(i=1; i < argc; i++){
-//        printf("Parsed option %s\n", argv[i]);
         if( !strcmp(argv[i], "-v") ){
             verbose = 1;
-//            printf("Verbose = %d \n", verbose);
             continue;
         }
         if( !strcmp(argv[i], "-h") ){
@@ -112,7 +110,7 @@ void parse_cmdline(int argc, char **argv)
     }
 }
 
-struct my {
+struct locks_with_counters{
     my_lock_t lock;
     volatile int counter1, counter2;
 };
@@ -121,7 +119,7 @@ struct stats_dbl{
     double avg, min, max;
 };
 
-struct my *data = NULL;
+struct locks_with_counters *data = NULL;
 
 void *create_seg(char *fname, int size)
 {
@@ -172,7 +170,6 @@ void *attach_seg(char *fname, int size)
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
     return seg_addr;
-
 }
 
 #define segname "seg"
@@ -181,7 +178,7 @@ void *attach_seg(char *fname, int size)
 #define RDONLY_REPS 10000
 #define WR_REPS 100
 
-void reset_data(struct my *data)
+void reset_data(struct locks_with_counters *data)
 {
     MPI_Barrier(MPI_COMM_WORLD);
     if( 0 == rank ){
@@ -191,7 +188,7 @@ void reset_data(struct my *data)
     MPI_Barrier(MPI_COMM_WORLD);
 }
 
-void calibrate_sleep(struct my *data)
+void calibrate_sleep(struct locks_with_counters *data)
 {
     double time;
     
@@ -260,7 +257,7 @@ void calibrate_sleep(struct my *data)
 }   
 
 
-void verification(struct my *data)
+void verification(struct locks_with_counters *data)
 {
     int i;
     
@@ -304,7 +301,7 @@ void verification(struct my *data)
     } 
 }
 
-void wronly_test(struct my* data, double *perf)
+void wronly_test(struct locks_with_counters* data, double *perf)
 {
     double time = 0, start;
     int i;
@@ -332,7 +329,7 @@ void wronly_test(struct my* data, double *perf)
     *perf = time;
 }
 
-void rdonly_test(struct my* data, struct stats_dbl *perf)
+void rdonly_test(struct locks_with_counters* data, struct stats_dbl *perf)
 {
     double time = 0, start, time_cum;
     int i;
@@ -376,7 +373,7 @@ void rdonly_test(struct my* data, struct stats_dbl *perf)
     MPI_Reduce(&time, &perf->max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 }
 
-void rdwr_test(struct my *data, struct stats_dbl *rlocks, 
+void rdwr_test(struct locks_with_counters *data, struct stats_dbl *rlocks, 
                 double *wr_time_out, double *wr_lock_time_out)
 {
     int cur_count = 0;
@@ -481,16 +478,14 @@ int main(int argc, char **argv)
     double rdwr_wr_time = 0, rdwr_wr_lock_ovh = 0;
     struct stats_dbl rdonly_lock_ovh, rlock_cnt;
     size_t seg_size;
-    seg_size = (sizeof(struct my) / 4096 + 1 ) * 4096;
+    seg_size = (sizeof(struct locks_with_counters) / 4096 + 1 ) * 4096;
 
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     
-    if (rank == 0){
-	parse_cmdline(argc, argv);
-    }
-
+    parse_cmdline(argc, argv);
+    
     {
         int delay = 0;
         while( delay ){
@@ -501,11 +496,10 @@ int main(int argc, char **argv)
     init_time = GET_TS();
     if( 0 == rank ) {
         membase = create_seg(segname, seg_size);
-        data = (struct my*)membase;
+        data = (struct locks_with_counters*)membase;
         data->counter1 = 0;
         data->counter2 = 0;
         shared_rwlock_create(&data->lock);
-	VERBOSE_OUT(verbose, "Shared Seg Created\n");
     }
     init_time = GET_TS() - init_time;
 
@@ -514,16 +508,15 @@ int main(int argc, char **argv)
     start = GET_TS();
     if( 0 != rank ){
         membase = attach_seg(segname, seg_size);
-        data = (struct my*)membase;
+        data = (struct locks_with_counters*)membase;
         shared_rwlock_init(&data->lock);
     }
     init_time += GET_TS() - start;
 
     calibrate_sleep(data);
     if (0 == rank){
-	VERBOSE_OUT(verbose, "Calibration Test Passed\n");
+        VERBOSE_OUT(verbose, "Calibration Test Passed\n");
     }
-
 
     // Correctness verification
 #if (!defined (MY_PTHREAD_MUTEX) || ( MY_PTHREAD_MUTEX == 0 ))
@@ -532,34 +525,43 @@ int main(int argc, char **argv)
      * call barrier together
      */
     verification(data);
-    if (0 == rank)VERBOSE_OUT(verbose, "Verification Test Passed\n");
+    if (0 == rank){
+        VERBOSE_OUT(verbose, "Verification Test Passed\n");
+    }
 #endif
     
-
     wronly_test(data, &wronly_lock_ovh);
-    if (0 == rank)    VERBOSE_OUT(verbose, "Write Only Test Passed\n");
+    if (0 == rank){
+        VERBOSE_OUT(verbose, "Write Only Test Passed\n");
+    }
+    
     rdonly_test(data, &rdonly_lock_ovh);
-    if (0 == rank)    VERBOSE_OUT(verbose, "Read Only Test Passed\n");
+    if (0 == rank){
+        VERBOSE_OUT(verbose, "Read Only Test Passed\n");
+    }
+ 
     if( !nordwr ){
         rdwr_test(data, &rlock_cnt, &rdwr_wr_time, &rdwr_wr_lock_ovh);
-	if (0 == rank)	VERBOSE_OUT(verbose, "Read/Write Test Passed\n");
+	if (0 == rank){
+            VERBOSE_OUT(verbose, "Read/Write Test Passed\n");
+        }
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
     
     if( rank == 0){
         if( print_header ){
-            printf("readers\tWO:ovh\tWO:lk/s\tRO:ovh[avg/min/max]\tRO:lk/s");
+            printf("readers;WO:ovh;WO:lk/s;RO:avg_ovh;RO:min_ovh;RO:max_ovh;RO:lk/s;");
             if( !nordwr ) {
-                printf("\tRW:wovh\tRW:wtm\tRW:rlk/s[avg/min/max]");
+                printf("RW:wovh;RW:wtm;RW:avg_rlk/s_amount;RW:min_rlk/s;RW:max_rlk/s;");
             }
             printf("\n");
         }
-        printf("%d\t%.0le\t%u\t%.0le/%.0le/%0.le\t%u",
+        printf("%d;%.5lf;%u;%.5lf;%.5lf;%.5lf;%u;",
                 size - 1, wronly_lock_ovh, (unsigned)(WRONLY_REPS/wronly_lock_ovh),
                 rdonly_lock_ovh.avg, rdonly_lock_ovh.min, rdonly_lock_ovh.max, (unsigned)((size-1) * RDONLY_REPS/rdonly_lock_ovh.avg));
         if( !nordwr ){
-            printf("\t%.9lf\t%.9lf\t%u (min=%u, max=%u)",rdwr_wr_lock_ovh / WR_REPS, rdwr_wr_time, 
+            printf("%.9lf;%.9lf;%u;%u;%u;",rdwr_wr_lock_ovh / WR_REPS, rdwr_wr_time, 
                         (size-1)*(unsigned)(rlock_cnt.avg / rdwr_wr_time), (unsigned)(rlock_cnt.min / rdwr_wr_time),
                         (unsigned)(rlock_cnt.max / rdwr_wr_time));
         }

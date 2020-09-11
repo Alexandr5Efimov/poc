@@ -1,4 +1,4 @@
-#include "1nmsc.h"
+#include "nblock.h"
 #include "lock.h"
 #include <mpi.h>
 #include <stdio.h>
@@ -9,10 +9,20 @@
 #include <dirent.h>
 #include <errno.h>
 #include <assert.h>
-#include "x86.h"
 #include <unistd.h>
+#include <string.h>
 
-#define compiler_fence() { asm volatile ("" : : : "memory"); }
+#if defined(__x86_64__)
+#include "atomic_x86.h"
+#define compiler_fence() { __asm__ __volatile__ ("sfence" : : : "memory"); }
+#define proc_sleep() { __asm__ __volatile__ ("pause" : : : "memory"); }
+#elif defined(__PPC64__)
+#include "atomic_ppc.h"
+#define compiler_fence() { __asm__ __volatile__ ("lwsync": : :"memory");}
+#define proc_sleep() { __asm__ __volatile__ ("yield" : : : "memory"); }
+#else
+    printf("Unknown processor architecture!\n");
+#endif
 
 static int init_by_me = 0;
 static int lock_num = 0; 
@@ -26,15 +36,10 @@ int shared_rwlock_create(my_lock_t *lock) /* rank == 0 */
     lock_num--;
 
     if( sizeof(lock->locks) / sizeof(lock->locks[0]) * 2 < lock_num ) {
-        printf("Too many processes, cannot allocate enough locks\n");
         MPI_Abort(MPI_COMM_WORLD, 0);
     }
 
-    for(i = 0; i < lock_num; i++) {
-        lock->locks[i].e.head = 0;
-        lock->locks[i].e.record[0].next = 0;
-        lock->locks[i].e.record[1].next = 0;
-    }
+    memset(lock->locks, 0, sizeof(lock->locks));
     
     init_by_me = 1; /* rank 0 will be write */
     record_idx = 2; // 1 - client for read, 0 - for nobody as next
@@ -47,20 +52,29 @@ int shared_rwlock_init(my_lock_t *lock) /* rank != 0 */
     record_idx = 1; // 2 - server for write, 0 - for nobody as next
 }
 
-inline void shared_rwlock_lock(msc_lock_t *msc_lock)
+inline void _mcs_swap_head(mcs_lock_t *mcs_lock)
 {
     uint32_t prev_idx;
-    (&msc_lock->record[record_idx - 1])->next = 0;
+    (&mcs_lock->record[record_idx - 1])->next = 0;
     
-    prev_idx = (uint32_t)atomic_swap((int64_t*)&msc_lock->head, (int64_t)record_idx);
+    prev_idx = (uint32_t)atomic_swap((int64_t*)&mcs_lock->head, (int64_t)record_idx);
+    (&mcs_lock->record[record_idx - 1])->swap_res = prev_idx;
+}
+
+inline void _mcs_lock(mcs_lock_t *mcs_lock)
+{
+    uint32_t prev_idx;
+    
+    prev_idx = (&mcs_lock->record[record_idx - 1])->swap_res;
+
     if( 0 == prev_idx ) {
         return;
     }
 
-    (&msc_lock->record[record_idx-1])->locked = 1;
+    (&mcs_lock->record[record_idx-1])->locked = 1;
 
     compiler_fence();
-    (&msc_lock->record[prev_idx-1])->next = record_idx;
+    (&mcs_lock->record[prev_idx-1])->next = record_idx;
     compiler_fence();
 
     /* TODO: Find out
@@ -68,47 +82,53 @@ inline void shared_rwlock_lock(msc_lock_t *msc_lock)
      * was unable to prevent compiler from optimizing this part of the
      * code resulting in a deadlock
      */
-    volatile uint32_t *flag = &((&msc_lock->record[record_idx - 1])->locked);
+    volatile uint32_t *flag = &((&mcs_lock->record[record_idx - 1])->locked);
     while(*flag){
-        asm volatile ("pause" : : : "memory");
+        proc_sleep();
     }
 }
 
 void shared_rwlock_rlock(my_lock_t *lock)
 {
-    shared_rwlock_lock(&lock->locks[lock_idx].e);
+    _mcs_swap_head(&lock->locks[lock_idx].e);
+    _mcs_lock(&lock->locks[lock_idx].e);
 }
 
 void shared_rwlock_wlock(my_lock_t *lock)
 {
     int i;
     for(i = 0; i < lock_num; i++) {
-        shared_rwlock_lock(&lock->locks[i].e);
+        _mcs_swap_head(&lock->locks[i].e);
     }
+
+    for(i = 0; i < lock_num; i++) {
+        _mcs_lock(&lock->locks[i].e);
+    }
+
 }
 
-void shared_rwlock_ulock(msc_lock_t *msc_lock)
+static inline void _mcs_unlock(mcs_lock_t *mcs_lock)
 {
-    if( CAS((int64_t*)(&msc_lock->head), (int64_t)record_idx, (int64_t)NULL) ) {
+    if( CAS((int64_t*)(&mcs_lock->head), (int64_t)record_idx, (int64_t)NULL) ) {
         // No one elase approached the lock after this thread
         return;
     }
 
     // Wait for the next record initialization
-    volatile uint32_t *flag = &((&msc_lock->record[record_idx-1])->next);
+    volatile uint32_t *flag = &((&mcs_lock->record[record_idx-1])->next);
     while(!(*flag)){
-        asm volatile ("pause" : : : "memory");
+        proc_sleep();
     }
 
     // Release the next one in a queue
-    uint32_t next_idx = (&msc_lock->record[record_idx-1])->next;
+    uint32_t next_idx = (&mcs_lock->record[record_idx-1])->next;
     compiler_fence();
-    (&msc_lock->record[next_idx-1])->locked = 0;
-    asm volatile ("sfence" : : : "memory");
+    (&mcs_lock->record[next_idx-1])->locked = 0;
+    compiler_fence();
 
     // lock is released
-    (&msc_lock->record[record_idx-1])->next = 0;
-    (&msc_lock->record[record_idx-1])->locked = 0; //?
+    (&mcs_lock->record[record_idx-1])->next = 0;
+    (&mcs_lock->record[record_idx-1])->locked = 0; //?
 }
 
 void shared_rwlock_unlock(my_lock_t *lock)
@@ -116,10 +136,10 @@ void shared_rwlock_unlock(my_lock_t *lock)
     int i;
     if( init_by_me ){
     	for(i = 0; i < lock_num; i++) {
-            shared_rwlock_ulock(&lock->locks[i].e);
+            _mcs_unlock(&lock->locks[i].e);
         }
     } else {
-        shared_rwlock_ulock(&lock->locks[lock_idx].e);
+        _mcs_unlock(&lock->locks[lock_idx].e);
     }
 }
 

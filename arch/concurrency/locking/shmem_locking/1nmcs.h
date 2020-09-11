@@ -1,23 +1,22 @@
-#ifndef MY_MSC_H
-#define MY_MSC_H
+#ifndef MY_MCS_H
+#define MY_MCS_H
 #include <stdint.h>
 
-typedef struct msc_list_s {
+typedef struct mcs_list_s {
     volatile uint32_t locked;
     volatile uint32_t next;
-} msc_list_t;
+} mcs_list_t;
 
-typedef struct msc_lock_s {
+typedef struct mcs_lock_s {
     volatile uint64_t head;
-    msc_list_t record[2]; // [0] - for client to read, [1] - for server to write
-} msc_lock_t;
+    mcs_list_t record[2]; // [0] - for client to read, [1] - for server to write
+} mcs_lock_t;
 
 /* cache line alignment */
 typedef struct  {
-    msc_lock_t e;
-    char padding[64 - sizeof(msc_lock_t)];
+    mcs_lock_t e;
+    char padding[64 - sizeof(mcs_lock_t)];
 } align_lock_t;
-
 
 typedef struct {
     align_lock_t locks[512];
