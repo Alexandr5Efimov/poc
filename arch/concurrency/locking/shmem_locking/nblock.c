@@ -52,25 +52,18 @@ int shared_rwlock_init(my_lock_t *lock) /* rank != 0 */
     record_idx = 1; // 2 - server for write, 0 - for nobody as next
 }
 
-inline void _mcs_swap_head(mcs_lock_t *mcs_lock)
+static inline int _mcs_fast_path(mcs_lock_t *mcs_lock)
 {
     uint32_t prev_idx;
     (&mcs_lock->record[record_idx - 1])->next = 0;
     
     prev_idx = (uint32_t)atomic_swap((int64_t*)&mcs_lock->head, (int64_t)record_idx);
-    (&mcs_lock->record[record_idx - 1])->swap_res = prev_idx;
+
+    return prev_idx;
 }
 
-inline void _mcs_lock(mcs_lock_t *mcs_lock)
+static inline void _mcs_slow_path(mcs_lock_t *mcs_lock, int prev_idx)
 {
-    uint32_t prev_idx;
-    
-    prev_idx = (&mcs_lock->record[record_idx - 1])->swap_res;
-
-    if( 0 == prev_idx ) {
-        return;
-    }
-
     (&mcs_lock->record[record_idx-1])->locked = 1;
 
     compiler_fence();
@@ -90,21 +83,35 @@ inline void _mcs_lock(mcs_lock_t *mcs_lock)
 
 void shared_rwlock_rlock(my_lock_t *lock)
 {
-    _mcs_swap_head(&lock->locks[lock_idx].e);
-    _mcs_lock(&lock->locks[lock_idx].e);
+    int fp_res;
+    fp_res = _mcs_fast_path(&lock->locks[lock_idx].e);
+    if ( fp_res ){
+        _mcs_slow_path(&lock->locks[lock_idx].e, fp_res);
+    }
 }
 
 void shared_rwlock_wlock(my_lock_t *lock)
 {
-    int i;
+    int i, fp_res;
+    int sp_locks_cnt = 0;
+    int SP_locks_idx[lock_num];
+    int SP_locks_res[lock_num];
+    
     for(i = 0; i < lock_num; i++) {
-        _mcs_swap_head(&lock->locks[i].e);
+        fp_res = _mcs_fast_path(&lock->locks[i].e);
+        if ( 0 != fp_res ) {
+            SP_locks_idx[sp_locks_cnt] = i;
+            SP_locks_res[sp_locks_cnt] = fp_res;
+            sp_locks_cnt++;
+        }
     }
 
-    for(i = 0; i < lock_num; i++) {
-        _mcs_lock(&lock->locks[i].e);
+    if (sp_locks_cnt > 0){
+        for(i = 0; i < sp_locks_cnt; i++) {
+            _mcs_slow_path(&lock->locks[SP_locks_idx[i]].e, SP_locks_res[i]);
+        }
+        sp_locks_cnt = 0;
     }
-
 }
 
 static inline void _mcs_unlock(mcs_lock_t *mcs_lock)

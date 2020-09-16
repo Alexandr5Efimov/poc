@@ -5,7 +5,6 @@
 typedef struct mcs_list_s {
     volatile uint32_t locked;
     volatile uint32_t next;
-    volatile uint32_t swap_res;
 } mcs_list_t;
 
 typedef struct mcs_lock_s {
